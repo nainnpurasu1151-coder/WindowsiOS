@@ -37,11 +37,76 @@ API="https://api.uupdump.net"
 UUP_DIR="$WORK/uup"
 mkdir -p "$WORK/downloads"
 
+# --- begin run logging ---------------------------------------------------
+# GitHub annotations only surface lines that contain workflow commands
+# (::error:: / ::warning:: / ::notice::). A failure that emits none --
+# e.g. a *parse* error under the macOS runner /bin/bash 3.2, where the
+# ERR trap never gets a chance to run -- otherwise shows up as a bare
+# "Process completed with exit code 2" with no explanation anywhere
+# (exactly how image workflow run #4 died; see the WARNING in the UUID
+# resolution heredoc below). So from here on, mirror all output to a
+# log file, and on any non-zero exit re-emit the tail of that log as
+# ::error:: annotations through the saved real stdout (fd 3).
+FETCH_LOG="$WORK/fetch_uup_esd.log"
+# Set to 1 only at the points where the script has genuinely finished
+# its job (just before the ESD branch exit 0, and at the end of the UUP
+# route). fetch_on_exit treats "status 0 but never completed" as a
+# failure: under bash 3.2 with set -e, a parse error is reported to the
+# EXIT trap as status 0, which would otherwise turn a dead script into
+# a green step.
+FETCH_COMPLETED=""
+if command -v tee >/dev/null 2>&1; then
+    : > "$FETCH_LOG"
+    exec 3>&1
+    exec > >(tee -a "$FETCH_LOG") 2>&1
+    fetch_on_exit() {
+        local rc=$?
+        if [ "$rc" -eq 0 ] && [ -z "$FETCH_COMPLETED" ]; then
+            rc=2
+        fi
+        if [ "$rc" -ne 0 ]; then
+            # Close the tee feed, then wait for the log size to settle
+            # so the tail below really is the tail.
+            exec 1>&- 2>&-
+            local prev="" cur="" tries=0
+            while [ "$tries" -lt 10 ]; do
+                cur="$(wc -c < "$FETCH_LOG" 2>/dev/null | tr -d ' ')"
+                if [ -n "$prev" ] && [ "$cur" = "$prev" ]; then
+                    break
+                fi
+                prev="$cur"
+                tries=$((tries + 1))
+                sleep 0.3
+            done
+            echo "::error::fetch_uup_esd.sh exited with code $rc; last log lines follow" >&3
+            tail -n 15 "$FETCH_LOG" 2>/dev/null | while IFS= read -r logline; do
+                printf '::error::%s\n' "$(printf '%s' "$logline" | sed -e 's/%/%25/g' -e 's/\r/%0D/g')" >&3
+            done
+        fi
+        exit "$rc"
+    }
+else
+    fetch_on_exit() {
+        local rc=$?
+        if [ "$rc" -eq 0 ] && [ -z "$FETCH_COMPLETED" ]; then
+            rc=2
+        fi
+        if [ "$rc" -ne 0 ]; then
+            echo "::error::fetch_uup_esd.sh exited with code $rc (tee unavailable; scroll the step log for the cause)"
+        fi
+        exit "$rc"
+    }
+fi
+trap fetch_on_exit EXIT
+echo "::notice::fetch_uup_esd.sh starting (bash $BASH_VERSION)"
+# --- end run logging -----------------------------------------------------
+
 if [ -n "${ESD_URL:-}" ]; then
     echo "== Downloading ESD directly from ESD_URL =="
     curl -L --fail --retry 5 --retry-all-errors --retry-delay 5 -o "$OUT_ESD" "$ESD_URL"
     ls -lh "$OUT_ESD"
     echo "=== ESD ready (direct URL) ==="
+    FETCH_COMPLETED=1
     exit 0
 fi
 
@@ -87,9 +152,15 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 builds = d["response"]["builds"]
 # NOTE: "builds" is keyed by an opaque row index ("14", "60", ...), NOT
-# by UUID -- the update UUID lives in each entry's "uuid" field. An
-# earlier version of this script used the dict key as the UUID and
+# by UUID -- the update UUID lives in the "uuid" field of each entry.
+# An earlier version of this script used the dict key as the UUID and
 # resolved to nonsense ids like "60".
+# WARNING: never put an apostrophe (or any single quote) anywhere in
+# this heredoc body, not even in comments or Python strings. The heredoc
+# sits inside a "$( )" command substitution, and the macOS runner
+# /bin/bash 3.2 parser mis-tracks quotes there: one stray apostrophe
+# makes the whole script die at parse time with exit code 2 before a
+# single command runs (image workflow run #4, 2026-11-19).
 cands = []
 for b in builds.values():
     title = b.get("title", "")
@@ -211,3 +282,4 @@ bash "$ROOT/scripts/ci/build_synthetic_esd.sh" "$ISO_PATH" "$OUT_ESD"
 rm -rf "$UUP_DIR" "$CONV_DIR" "$ISO_PATH"
 ls -lh "$OUT_ESD"
 echo "=== ESD ready (UUP route) ==="
+FETCH_COMPLETED=1
