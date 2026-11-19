@@ -39,7 +39,7 @@ mkdir -p "$WORK/downloads"
 
 if [ -n "${ESD_URL:-}" ]; then
     echo "== Downloading ESD directly from ESD_URL =="
-    curl -L --fail --retry 3 -o "$OUT_ESD" "$ESD_URL"
+    curl -L --fail --retry 5 --retry-all-errors --retry-delay 5 -o "$OUT_ESD" "$ESD_URL"
     ls -lh "$OUT_ESD"
     echo "=== ESD ready (direct URL) ==="
     exit 0
@@ -50,36 +50,88 @@ SEARCH="${UUP_SEARCH:-26100}"
 LANG_CODE="${UUP_LANG:-en-us}"
 EDITION="${UUP_EDITION:-professional}"
 
+# --- begin network helpers ---
+# api.uupdump.net is intermittently unreachable (connection resets /
+# exit 56, 504s, timeouts -- seen both from CI runners and locally), and
+# no mirror of the JSON API exists, so every API call goes through two
+# retry layers: curl's own --retry-all-errors, plus an outer loop that
+# also re-fetches when the body is not the JSON shape we expect (a proxy
+# error page can come back with HTTP 200). fetch_json succeeds only when
+# the downloaded file parses as JSON AND the given check expression
+# (evaluated with d = the parsed document) is truthy.
+fetch_json() {
+    local url="$1" out="$2" check="$3" attempt
+    for attempt in 1 2 3 4; do
+        if curl -sS --fail --retry 5 --retry-all-errors --retry-delay 5 \
+                --retry-max-time 300 --connect-timeout 20 \
+                -o "$out" "$url" \
+           && python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if eval(sys.argv[2]) else 1)' "$out" "$check"; then
+            return 0
+        fi
+        echo "::warning::fetch_json attempt $attempt failed for $url"
+        sleep 10
+    done
+    echo "::error::fetch_json: giving up on $url after 4 attempts"
+    return 1
+}
+# --- end network helpers ---
+
 if [ -z "$UUID" ]; then
     echo "== Resolving newest Windows 11 ARM64 build (search='$SEARCH') via UUP dump API =="
-    curl -s --fail "$API/listid.php?search=$SEARCH&sortByDate=1" -o "$WORK/listid.json"
+    fetch_json "$API/listid.php?search=$SEARCH&sortByDate=1" "$WORK/listid.json" \
+        '"builds" in d.get("response", {})'
     UUID="$(python3 - "$WORK/listid.json" <<'PYEOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 builds = d["response"]["builds"]
+# NOTE: "builds" is keyed by an opaque row index ("14", "60", ...), NOT
+# by UUID -- the update UUID lives in each entry's "uuid" field. An
+# earlier version of this script used the dict key as the UUID and
+# resolved to nonsense ids like "60".
 cands = []
-for uuid, b in builds.items():
+for b in builds.values():
     title = b.get("title", "")
-    if b.get("arch") == "arm64" and title.startswith("Windows 11"):
+    uuid = b.get("uuid", "")
+    if b.get("arch") == "arm64" and title.startswith("Windows 11") and uuid:
         cands.append((b.get("created") or 0, uuid, title))
 cands.sort(reverse=True)
 if not cands:
     sys.exit("no Windows 11 arm64 build matched the search")
-print(cands[0][1], file=sys.stderr)
+print(f"newest match: {cands[0][2]} (uuid {cands[0][1]})", file=sys.stderr)
 sys.stdout.write(cands[0][1])
 PYEOF
 )"
     echo "Resolved UUP build UUID: $UUID"
 fi
 
+# A resolved or user-supplied id that is not UUID-shaped can only fail
+# downstream; reject it here where the cause is obvious.
+if ! [[ "$UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    echo "::error::'$UUID' is not a valid UUP build UUID"
+    exit 1
+fi
+
 echo "== Checking language availability ($LANG_CODE) =="
-curl -s --fail "$API/listlangs.php?id=$UUID" -o "$WORK/listlangs.json" || true
-if [ -s "$WORK/listlangs.json" ] && ! grep -qi "\"$LANG_CODE\"" "$WORK/listlangs.json"; then
-    echo "::warning::language '$LANG_CODE' not found in listlangs response for $UUID; continuing (get.php will fail loudly if unusable)"
+# Advisory only (get.php below is the real gate), so a fetch failure here
+# must not kill the run -- but go through the same retrying fetcher.
+if fetch_json "$API/listlangs.php?id=$UUID" "$WORK/listlangs.json" \
+        '"langList" in d.get("response", {})'; then
+    python3 - "$WORK/listlangs.json" "$LANG_CODE" <<'PYEOF' || true
+import json, sys
+langs = json.load(open(sys.argv[1]))["response"]["langList"]
+if sys.argv[2] not in langs:
+    print(f"::warning::language '{sys.argv[2]}' not in listlangs response "
+          f"({len(langs)} languages listed); continuing (get.php will fail loudly if unusable)")
+PYEOF
+else
+    echo "::warning::listlangs fetch failed for $UUID; continuing without the language check"
 fi
 
 echo "== Fetching UUP file list (lang=$LANG_CODE edition=$EDITION) =="
-curl -s --fail "$API/get.php?id=$UUID&lang=$LANG_CODE&edition=$EDITION" -o "$WORK/uup_files.json"
+fetch_json "$API/get.php?id=$UUID&lang=$LANG_CODE&edition=$EDITION" "$WORK/uup_files.json" \
+    '"files" in d.get("response", {}) and len(d["response"]["files"]) > 0'
 
 echo "== Downloading UUP set from Microsoft update servers =="
 rm -rf "$UUP_DIR"
@@ -110,7 +162,7 @@ outdir = Path(sys.argv[2])
 for name, meta in d["response"]["files"].items():
     dest = outdir / name
     if not dest.exists():
-        subprocess.run(["curl", "-L", "--fail", "--retry", "3", "-o", str(dest), meta["url"]], check=True)
+        subprocess.run(["curl", "-L", "--fail", "--retry", "5", "--retry-all-errors", "--retry-delay", "5", "-o", str(dest), meta["url"]], check=True)
     if meta.get("sha1"):
         got = subprocess.check_output(["shasum", "-a", "1", str(dest)]).split()[0].decode()
         if got.lower() != meta["sha1"].lower():
