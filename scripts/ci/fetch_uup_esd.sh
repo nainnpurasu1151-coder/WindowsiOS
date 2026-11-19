@@ -24,7 +24,9 @@
 #   UUP_EDITION edition for the UUP set (default: professional)
 #
 # Requires: curl, python3, aria2 (optional, curl fallback), git, wimlib,
-# plus the converter's own macOS deps (cabextract, chntpw).
+# cabextract, plus genisoimage or mkisofs for the converter. chntpw (also
+# a hard converter requirement) is built from pinned upstream source by
+# scripts/ci/install_chntpw.sh, because Homebrew no longer carries it.
 set -euo pipefail
 trap 'echo "::error::fetch_uup_esd.sh failed at line $LINENO: ${BASH_COMMAND:0:300}" >&2' ERR
 
@@ -117,6 +119,21 @@ print("curl fallback download + SHA-1 verification complete")
 PYEOF
 fi
 du -sh "$UUP_DIR"
+
+# The converter refuses to run unless cabextract, wimlib-imagex, chntpw
+# and genisoimage/mkisofs are all within reach. cabextract and wimlib
+# come from the workflow's brew step; cover the two that step cannot
+# guarantee: mkisofs (in the cdrtools formula) and chntpw (no Homebrew
+# formula exists any more -- built from pinned source instead).
+if ! command -v genisoimage >/dev/null 2>&1 && ! command -v mkisofs >/dev/null 2>&1; then
+    echo "== Installing cdrtools (provides mkisofs) for the converter =="
+    brew install cdrtools
+fi
+if ! command -v chntpw >/dev/null 2>&1; then
+    bash "$ROOT/scripts/ci/install_chntpw.sh" "$WORK/tools"
+    export PATH="$WORK/tools/bin:$PATH"
+fi
+command -v chntpw
 
 echo "== Converting UUP set to ISO (official UUP dump converter) =="
 CONV_DIR="$WORK/converter"
