@@ -17,6 +17,11 @@
 #                             ~40 min, so a run that already produced a
 #                             good ESD never has to fetch again
 #   installer                 ESD -> build winvm -> installer image
+#   fetch-inputs              reuse the image-inputs artifact of a previous
+#                             run (input: inputs_run_id) and resume directly
+#                             at phase1, skipping the ESD + installer stages
+#                             (also re-imports that run's windows-esd for the
+#                             optimizer when esd_run_id is left empty)
 #   phase1                    WinPE boot: partition + DISM apply + bcdboot
 #   phase2                    first boot: specialize + OOBE + clean shutdown
 #   optimize                  offline bloat removal (WinPE + opt_hive exe),
@@ -87,6 +92,10 @@ on:
         description: "Run ID of a previous 'Build Windows 11 machine image' run holding a windows-esd artifact (optional; empty = fetch the media here, ~40 min)"
         type: string
         default: ""
+      inputs_run_id:
+        description: "Run ID of a previous image run holding an image-inputs artifact (optional; skips the ESD and installer stages)"
+        type: string
+        default: ""
       min_free_gb:
         description: "Fail fast if the runner has less free disk (GB)"
         type: string
@@ -148,7 +157,7 @@ jobs:
   # passing esd_run_id (same pattern as helpers_run_id above): reuse-esd
   # then imports that run's artifact and re-uploads it under this run.
   fetch-esd:
-    if: ${{ inputs.esd_run_id == '' }}
+    if: ${{ inputs.esd_run_id == '' && inputs.inputs_run_id == '' }}
     runs-on: macos-latest
     timeout-minutes: 120
     steps:
@@ -207,10 +216,55 @@ jobs:
           if-no-files-found: error
 
   # ------------------------------------------------------------------
+  # Resume path: a previous run whose installer stage succeeded already
+  # holds the finished installer image as its image-inputs artifact, so a
+  # later run can import it here and start directly at phase1, skipping
+  # both the ~40 min media fetch and the installer build. The optimizer
+  # also needs the ESD (it builds its WinPE from it), so when esd_run_id
+  # is left empty this job re-imports the source run's windows-esd too;
+  # if esd_run_id IS set, reuse-esd provides the ESD instead and the two
+  # ESD steps below stand down (no duplicate artifact name).
+  fetch-inputs:
+    if: ${{ inputs.inputs_run_id != '' }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Download image-inputs artifact from the previous image run
+        uses: actions/download-artifact@v4
+        with:
+          name: image-inputs
+          path: inputs-in
+          run-id: ${{ inputs.inputs_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Re-upload as this run's image-inputs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-inputs
+          path: inputs-in/*.img
+          compression-level: 0
+          if-no-files-found: error
+      - name: Download windows-esd artifact from the same previous run
+        if: ${{ inputs.esd_run_id == '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-esd
+          path: esd-in
+          run-id: ${{ inputs.inputs_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Re-upload as this run's windows-esd artifact
+        if: ${{ inputs.esd_run_id == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-esd
+          path: esd-in/*.esd
+          compression-level: 0
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
   installer:
     needs: [fetch-esd, reuse-esd]
     if: >-
-      always() &&
+      inputs.inputs_run_id == '' && always() &&
       (needs.fetch-esd.result == 'success' || needs.reuse-esd.result == 'success')
     runs-on: macos-latest
     timeout-minutes: 90
@@ -249,7 +303,8 @@ jobs:
 
   # ------------------------------------------------------------------
   phase1:
-    needs: installer
+    needs: [installer, fetch-inputs, helpers, fetch-helpers]
+    if: ${{ !cancelled() && (needs.installer.result == 'success' || needs.fetch-inputs.result == 'success') && (needs.helpers.result == 'success' || needs.fetch-helpers.result == 'success') }}
     runs-on: macos-latest
     timeout-minutes: 300
     steps:
@@ -297,6 +352,7 @@ jobs:
   # ------------------------------------------------------------------
   phase2:
     needs: phase1
+    if: ${{ !cancelled() && needs.phase1.result == 'success' }}
     runs-on: macos-latest
     timeout-minutes: 330
     steps:
@@ -346,10 +402,8 @@ jobs:
 
   # ------------------------------------------------------------------
   optimize:
-    needs: [phase2, helpers, fetch-helpers]
-    if: >-
-      always() && needs.phase2.result == 'success' &&
-      (needs.helpers.result == 'success' || needs.fetch-helpers.result == 'success')
+    needs: phase2
+    if: ${{ !cancelled() && needs.phase2.result == 'success' }}
     runs-on: macos-latest
     timeout-minutes: 240
     steps:
