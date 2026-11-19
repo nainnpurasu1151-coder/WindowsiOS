@@ -39,13 +39,21 @@ if [ -z "${CLANG:-}" ] || [ ! -x "$CLANG" ] || [ -z "${DLLTOOL:-}" ] || [ ! -x "
 fi
 echo "clang:   $CLANG"
 echo "dlltool: $DLLTOOL"
-# NB: do NOT use `| head -1` here. Under `set -o pipefail`, head exits after
-# the first line, the version printer then dies with SIGPIPE (141), and
-# pipefail turns that into a script failure at this line (seen in CI run #2).
-# `sed -n '1p'` prints the same first line but reads to EOF, so the producer
-# never gets SIGPIPE, while a genuine producer failure still propagates.
-"$CLANG" --version | sed -n '1p'
-"$DLLTOOL" --version | sed -n '1p'
+# Version banners are diagnostics ONLY and must never abort the build.
+# CI run #2 died on the clang line via `| head -1` and run #3 died on the
+# dlltool line via `| sed -n '1p'`: under `set -o pipefail`, a banner
+# pipeline whose reader stops after line 1 leaves the version printer to
+# die with SIGPIPE (141), and pipefail promotes that to a script failure.
+# (The ERR annotation names the pipeline's last command either way, so it
+# cannot distinguish "sed stopped reading" from "the tool itself failed" --
+# and for a banner, the distinction does not matter.) Capture the output
+# instead: no pipe, no SIGPIPE, and failures are swallowed on purpose.
+# Tool *presence* is enforced by the -x checks above, and the real build
+# steps below (dlltool .def processing, clang+lld links) stay strict.
+CLANG_BANNER="$("$CLANG" --version 2>/dev/null || true)"
+DLLTOOL_BANNER="$("$DLLTOOL" --version 2>/dev/null || true)"
+echo "clang version:   ${CLANG_BANNER%%$'\n'*}"
+echo "dlltool version: ${DLLTOOL_BANNER%%$'\n'*}"
 # clang -fuse-ld=lld needs ld.lld / lld-link next to clang; check early.
 if [ ! -x "$(dirname "$CLANG")/ld.lld" ] && [ ! -x "$(dirname "$CLANG")/lld-link" ]; then
     echo "::warning::no ld.lld/lld-link next to clang; -fuse-ld=lld may fail"
