@@ -31,6 +31,12 @@ MNT="$TMP/mnt"
 mkdir -p "$MNT"
 cleanup() {
     hdiutil detach "$MNT" >/dev/null 2>&1 || true
+    # The stage tree is copied from the read-only ISO mount, so its
+    # directories keep r-x modes; a plain rm -rf by the (non-root) runner
+    # user then fails with Permission denied on every file inside them
+    # (seen in image workflow run #6, where the rm spam buried the real
+    # error). Make everything writable first so cleanup actually cleans.
+    chmod -R u+w "$TMP" >/dev/null 2>&1 || true
     rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -109,11 +115,18 @@ for item in efi boot bootmgr.efi; do
 done
 
 # --- Assemble the synthetic ESD (solid/LZMS, like a retail ESD) --------
+# Only the FIRST image may be created with `capture`: wimlib's capture
+# OVERWRITES an existing destination file (it is the create primitive);
+# the appending primitives are `export` and `append`. An earlier version
+# used `capture` for the three filler images too, so each filler silently
+# replaced the whole ESD and the final file held only {last filler, Pro}
+# = 2 images -- the "synthetic ESD has 2 images, expected 6" failure of
+# image workflow run #6 (reproduced locally with wimlib 1.14.4).
 rm -f "$OUT"
 "$WIMLIB" capture "$STAGE" "$OUT" "Windows Setup Media" --solid >/dev/null
 "$WIMLIB" export "$TMP/boot.wim" "$PE_IDX" "$OUT" --solid >/dev/null
 for i in 3 4 5; do
-    "$WIMLIB" capture "$STAGE" "$OUT" "Windows Setup Media (layout filler $i)" --solid >/dev/null
+    "$WIMLIB" append "$STAGE" "$OUT" "Windows Setup Media (layout filler $i)" --solid >/dev/null
 done
 "$WIMLIB" export "$TMP/install.img" "$PRO_IDX" "$OUT" --solid >/dev/null
 
@@ -121,5 +134,7 @@ echo "== Synthetic ESD layout =="
 "$WIMLIB" info "$OUT" | grep -E "Index:|Name:" || true
 COUNT="$("$WIMLIB" info "$OUT" | grep -c '^Index:' || true)"
 [ "$COUNT" = "6" ] || { echo "::error::synthetic ESD has $COUNT images, expected 6"; exit 1; }
+NAMES="$("$WIMLIB" info "$OUT" | grep '^Name:' | sed 's/^Name:[[:space:]]*//' | paste -sd '|' -)"
+echo "::notice::synthetic ESD layout (6 images): $NAMES"
 ls -lh "$OUT"
 echo "=== synthetic ESD ready ==="
