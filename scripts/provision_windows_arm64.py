@@ -263,7 +263,7 @@ def run_winvm_phase(phase_name: str, extra_args: list[str], screen_png: Path, ma
         "--vars", str(VARS_FD),
         "--disk", str(WIN_IMG),
         "--cpus", "4",
-        "--ram", "4096",
+        "--ram", os.environ.get("WINIOS_VM_RAM", "4096"),
         "--no-net",
         "--cmd-file", str(cmd_file),
         "--screenshot", str(screen_png),
@@ -293,27 +293,55 @@ def run_winvm_phase(phase_name: str, extra_args: list[str], screen_png: Path, ma
 
 def main():
     WORK.mkdir(parents=True, exist_ok=True)
-    if not ESD.exists():
-        sys.exit(f"Missing {ESD}")
     if not WINVM.exists():
         sys.exit(f"Missing {WINVM}")
 
-    build_two_partition_installer()
+    # Fork/CI addition: run one stage per GitHub Actions job when asked.
+    # WINIOS_PROVISION_STAGE = all (default; original upstream behaviour)
+    # | installer | phase1 | phase2. The phase time caps and the guest RAM
+    # size are env-tunable for slower/smaller CI runners; defaults are the
+    # upstream values. The ESD is only consumed by the installer stage
+    # (wimlib exports) and by optimize_windows_lite.py, so only that stage
+    # requires it; the phase stages still get the file-exists guarantee for
+    # code.fd/vars.fd handling below.
+    stage = os.environ.get("WINIOS_PROVISION_STAGE", "all")
+    if stage not in ("all", "installer", "phase1", "phase2"):
+        sys.exit(f"Unknown WINIOS_PROVISION_STAGE={stage!r}")
+    if stage in ("all", "installer") and not ESD.exists():
+        sys.exit(f"Missing {ESD}")
+    phase1_minutes = int(os.environ.get("WINIOS_PHASE1_MINUTES", "40"))
+    phase2_minutes = int(os.environ.get("WINIOS_PHASE2_MINUTES", "60"))
+
+    if stage in ("all", "installer"):
+        build_two_partition_installer()
+    if stage == "installer":
+        print("SUCCESS: installer image built (stage=installer)", flush=True)
+        return
 
     shutil.copyfile("/opt/homebrew/share/qemu/edk2-aarch64-code.fd", CODE_FD)
-    shutil.copyfile("/opt/homebrew/share/qemu/edk2-arm-vars.fd", VARS_FD)
+    if stage in ("all", "phase1"):
+        shutil.copyfile("/opt/homebrew/share/qemu/edk2-arm-vars.fd", VARS_FD)
+        if WIN_IMG.exists():
+            WIN_IMG.unlink()
+        with open(WIN_IMG, "wb") as f:
+            f.truncate(32 * 1024 * 1024 * 1024)
 
-    if WIN_IMG.exists():
-        WIN_IMG.unlink()
-    with open(WIN_IMG, "wb") as f:
-        f.truncate(32 * 1024 * 1024 * 1024)
-
-    # Phase 1: Boot WinPE -> partition -> DISM unsplit install.wim -> offline reg + unattend -> bcdboot -> wpeutil shutdown
-    run_winvm_phase("phase1_dism", ["--disk1", str(INST_IMG)], WORK / "prov_phase1.png", max_minutes=40)
-    shutil.copyfile(VARS_FD, WORK / "vars_post_dism.fd")
+        # Phase 1: Boot WinPE -> partition -> DISM unsplit install.wim -> offline reg + unattend -> bcdboot -> wpeutil shutdown
+        run_winvm_phase("phase1_dism", ["--disk1", str(INST_IMG)], WORK / "prov_phase1.png", max_minutes=phase1_minutes)
+        shutil.copyfile(VARS_FD, WORK / "vars_post_dism.fd")
+        if stage == "phase1":
+            print("SUCCESS: phase 1 (DISM) complete (stage=phase1)", flush=True)
+            return
 
     # Phase 2: Boot installed Windows 11 Pro ARM64 -> specialize -> reboot -> oobeSystem -> AutoLogon Ammaar -> clean shutdown
-    run_winvm_phase("phase2_oobe", [], WORK / "prov_phase2.png", max_minutes=60)
+    if stage == "phase2":
+        if not WIN_IMG.exists():
+            sys.exit(f"Missing {WIN_IMG} (run stage=phase1 first)")
+        post_dism_vars = WORK / "vars_post_dism.fd"
+        if not post_dism_vars.exists():
+            sys.exit(f"Missing {post_dism_vars} (run stage=phase1 first)")
+        shutil.copyfile(post_dism_vars, VARS_FD)
+    run_winvm_phase("phase2_oobe", [], WORK / "prov_phase2.png", max_minutes=phase2_minutes)
     shutil.copyfile(VARS_FD, WORK / "vars_clean.fd")
     print("SUCCESS: Windows 11 Pro ARM64 provisioned and cleanly shut down!", flush=True)
 

@@ -499,7 +499,7 @@ def run_winpe_optimizer():
         "--disk", str(LITE_IMG),
         "--disk1", str(PE_IMG),
         "--cpus", "4",
-        "--ram", "4096",
+        "--ram", os.environ.get("WINIOS_VM_RAM", "4096"),
         "--no-net",
         "--cmd-file", str(cmd_file),
         "--screenshot", str(shot_file),
@@ -518,7 +518,9 @@ def run_winpe_optimizer():
                     cf.write(f"screenshot {shot_file}\n")
                 print(f"[opt-winpe +{int(elapsed)}s] running...", flush=True)
                 next_shot += 20
-            if elapsed > 25 * 60:
+            # Fork/CI addition: cap is env-tunable for slower CI runners
+            # (WINIOS_OPT_MINUTES); default is the upstream 25 minutes.
+            if elapsed > float(os.environ.get("WINIOS_OPT_MINUTES", "25")) * 60:
                 proc.terminate()
                 raise TimeoutError("WinPE optimizer exceeded 25 minutes")
             time.sleep(2)
