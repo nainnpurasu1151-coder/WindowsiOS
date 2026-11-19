@@ -14,23 +14,44 @@
 #   brew install llvm
 set -euo pipefail
 
+# Surface the failing command as a workflow annotation, so a CI failure is
+# diagnosable from the run page / public API without the raw job log.
+trap 'cmd="${BASH_COMMAND//\%/%25}"; echo "::error::build_guest_helpers.sh failed at line $LINENO: ${cmd:0:300}" >&2' ERR
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/build"
 mkdir -p "$OUT/win32"
 
+# Homebrew LLVM is keg-only: its binaries never land on PATH, so resolve the
+# prefix explicitly (default path, then `brew --prefix llvm`, then PATH).
 LLVM_BIN="${LLVM_BIN:-/opt/homebrew/opt/llvm/bin}"
+if [ ! -x "$LLVM_BIN/llvm-dlltool" ] && command -v brew >/dev/null 2>&1; then
+    BREW_LLVM="$(brew --prefix llvm 2>/dev/null || true)"
+    [ -n "$BREW_LLVM" ] && [ -x "$BREW_LLVM/bin/llvm-dlltool" ] && LLVM_BIN="$BREW_LLVM/bin"
+fi
 CLANG="${CLANG:-$LLVM_BIN/clang}"
 DLLTOOL="${DLLTOOL:-$LLVM_BIN/llvm-dlltool}"
-[ -x "$CLANG" ] || CLANG="$(command -v clang)"
-[ -x "$DLLTOOL" ] || DLLTOOL="$(command -v llvm-dlltool)"
+[ -x "$CLANG" ] || CLANG="$(command -v clang || true)"
+[ -x "$DLLTOOL" ] || DLLTOOL="$(command -v llvm-dlltool || true)"
+if [ -z "${CLANG:-}" ] || [ ! -x "$CLANG" ] || [ -z "${DLLTOOL:-}" ] || [ ! -x "$DLLTOOL" ]; then
+    echo "::error::LLVM tools not found (clang='${CLANG:-none}', llvm-dlltool='${DLLTOOL:-none}'). Is 'brew install llvm' done?"
+    exit 1
+fi
 echo "clang:   $CLANG"
 echo "dlltool: $DLLTOOL"
+"$CLANG" --version | head -1
+"$DLLTOOL" --version | head -1
+# clang -fuse-ld=lld needs ld.lld / lld-link next to clang; check early.
+if [ ! -x "$(dirname "$CLANG")/ld.lld" ] && [ ! -x "$(dirname "$CLANG")/lld-link" ]; then
+    echo "::warning::no ld.lld/lld-link next to clang; -fuse-ld=lld may fail"
+fi
 
 # 1. Import libraries from the .def files (function lists mirror the
 #    __declspec(dllimport) declarations in the sources).
 for dll in kernel32 advapi32 ws2_32; do
     "$DLLTOOL" -m arm64 -d "$ROOT/tools/win32/$dll.def" -l "$OUT/win32/$dll.lib"
 done
+ls -lh "$OUT/win32/"
 
 CFLAGS=(--target=aarch64-pc-windows-msvc -O2 -ffreestanding -nostdlib
         -fno-stack-protector -fuse-ld=lld -Wno-unused-parameter)
