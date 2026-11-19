@@ -152,7 +152,7 @@ jobs:
           fi
 
       - name: Install tools
-        run: brew install wimlib qemu libslirp pkg-config aria2 cabextract chntpw
+        run: brew install wimlib qemu libslirp pkg-config aria2 cabextract cdrtools
 
       - name: Fetch Windows media (UUP route or direct ESD URL)
         env:
