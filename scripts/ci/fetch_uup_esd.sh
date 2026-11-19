@@ -263,23 +263,51 @@ CONV_DIR="$WORK/converter"
 rm -rf "$CONV_DIR"
 git clone --depth 1 https://git.uupdump.net/uup-dump/converter.git "$CONV_DIR" \
     || git clone --depth 1 https://github.com/uup-dump/converter.git "$CONV_DIR"
-# The converter's macOS entry point is convert.sh; depending on revision it
-# either runs inside the UUP folder or takes the folder as an argument.
-# Try the in-folder form first, then the argument form, and accept the
-# first ISO that appears anywhere under work/.
-( cd "$UUP_DIR" && bash "$CONV_DIR/convert.sh" ) || true
-ISO_PATH="$(find "$WORK" -name '*.iso' -type f 2>/dev/null | head -1 || true)"
+# The converter contract (convert.sh from uup-dump/converter v0.7.3,
+# verified against the cloned source and by local test runs):
+#   convert.sh [compression] [uups_directory] [create_virtual_editions]
+# $1 is the compression type ("wim" or "esd"), NOT a path; $2 is the
+# folder holding the UUP files (default: a "UUPs" folder under the
+# current directory); $3 toggles virtual editions (default 0). The ISO
+# is written into the *current* directory under a fully upper-cased
+# name: the converter runs tr "[:lower:]" "[:upper:]" over the whole
+# file name, extension included, producing e.g.
+# 26100.9974_PROFESSIONAL_ARM64_EN-US.ISO -- so the search below must
+# use -iname, because a case-sensitive -name '*.iso' can never match.
+# An earlier version of this script tried two other invocation shapes
+# (no arguments from inside the UUP folder, which makes the converter
+# look for a UUPs subfolder; and UUP path + ISO name as arguments,
+# which it reads as an invalid compression type). Both die instantly
+# in its argument checks, which is why image workflow run #5 produced
+# no ISO. Run it once, from a scratch directory, with its output in a
+# dedicated log, and judge the result by the exit code plus the
+# case-insensitive ISO search.
+CONV_RUN="$WORK/convert-run"
+CONV_LOG="$WORK/converter.log"
+rm -rf "$CONV_RUN"
+mkdir -p "$CONV_RUN"
+CONV_RC=0
+( cd "$CONV_RUN" && bash "$CONV_DIR/convert.sh" wim "$UUP_DIR" ) > "$CONV_LOG" 2>&1 || CONV_RC=$?
+echo "-- converter log (last 30 lines) --"
+tail -n 30 "$CONV_LOG" || true
+ISO_PATH="$(find "$CONV_RUN" -iname '*.iso' -type f 2>/dev/null | head -1 || true)"
 if [ -z "$ISO_PATH" ]; then
-    ( cd "$WORK" && bash "$CONV_DIR/convert.sh" "$UUP_DIR" "Win11_ARM64_UUP.iso" ) || true
-    ISO_PATH="$(find "$WORK" -name '*.iso' -type f 2>/dev/null | head -1 || true)"
+    ISO_PATH="$(find "$WORK" -iname '*.iso' -type f 2>/dev/null | head -1 || true)"
 fi
-[ -n "$ISO_PATH" ] && [ -f "$ISO_PATH" ] || { echo "::error::converter produced no ISO under $WORK"; ls -la "$WORK" "$UUP_DIR"; exit 1; }
+if [ "$CONV_RC" -ne 0 ] || [ -z "$ISO_PATH" ] || [ ! -f "$ISO_PATH" ]; then
+    echo "::error::UUP converter failed (exit code $CONV_RC, ISO found: '${ISO_PATH:-none}'); converter log tail follows"
+    tail -n 15 "$CONV_LOG" 2>/dev/null | while IFS= read -r convline; do
+        printf '::error::%s\n' "$(printf '%s' "$convline" | sed -e 's/%/%25/g' -e 's/\r/%0D/g')"
+    done
+    ls -la "$WORK" "$CONV_RUN" "$UUP_DIR" || true
+    exit 1
+fi
 echo "Converter produced: $ISO_PATH"
 
 echo "== Rebuilding retail-layout ESD from ISO =="
 bash "$ROOT/scripts/ci/build_synthetic_esd.sh" "$ISO_PATH" "$OUT_ESD"
 
-rm -rf "$UUP_DIR" "$CONV_DIR" "$ISO_PATH"
+rm -rf "$UUP_DIR" "$CONV_DIR" "$CONV_RUN" "$ISO_PATH"
 ls -lh "$OUT_ESD"
 echo "=== ESD ready (UUP route) ==="
 FETCH_COMPLETED=1
