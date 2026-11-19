@@ -10,8 +10,12 @@
 # need is clang + lld plus import libraries, which llvm-dlltool generates
 # from the .def files in tools/win32/.
 #
-# Requires Homebrew LLVM (clang, lld, llvm-dlltool):
-#   brew install llvm
+# Requires Homebrew clang + llvm-dlltool (the llvm formula) and an lld
+# linker (ld.lld / lld-link, from the SEPARATE lld formula -- the llvm
+# formula does not ship one). If lld is missing and brew is available,
+# the script installs the lld formula itself, because the CI
+# guest-helpers job installs llvm only:
+#   brew install llvm lld
 set -euo pipefail
 
 # Surface the failing command as a workflow annotation, so a CI failure is
@@ -54,10 +58,54 @@ CLANG_BANNER="$("$CLANG" --version 2>/dev/null || true)"
 DLLTOOL_BANNER="$("$DLLTOOL" --version 2>/dev/null || true)"
 echo "clang version:   ${CLANG_BANNER%%$'\n'*}"
 echo "dlltool version: ${DLLTOOL_BANNER%%$'\n'*}"
-# clang -fuse-ld=lld needs ld.lld / lld-link next to clang; check early.
-if [ ! -x "$(dirname "$CLANG")/ld.lld" ] && [ ! -x "$(dirname "$CLANG")/lld-link" ]; then
-    echo "::warning::no ld.lld/lld-link next to clang; -fuse-ld=lld may fail"
+# clang -fuse-ld=lld needs an lld linker (ld.lld / lld-link). Homebrew's
+# llvm formula does NOT ship one -- lld is a separate formula -- and the
+# CI guest-helpers job installs llvm only, which is exactly how run #4
+# died at the first link step (the previous version only warned about
+# the missing linker, then clang failed with nothing to run). Resolve
+# it robustly instead of just warning: next to clang, then the lld
+# formula's prefix, then PATH; if
+# still missing and brew is available, install the lld formula and
+# resolve again. The resolved bin dir is prepended to PATH, which is
+# where clang's -fuse-ld=lld search falls back to.
+LLD_PREFIX=""
+if command -v brew >/dev/null 2>&1; then
+    LLD_PREFIX="$(brew --prefix lld 2>/dev/null || true)"
 fi
+find_lld_bin() {
+    local d p
+    for d in "$(dirname "$CLANG")" "${LLD_PREFIX:-}/bin" \
+             /opt/homebrew/opt/lld/bin /usr/local/opt/lld/bin; do
+        [ -n "$d" ] && [ "$d" != "/bin" ] || continue
+        if [ -x "$d/ld.lld" ] || [ -x "$d/lld-link" ]; then
+            printf '%s\n' "$d"
+            return 0
+        fi
+    done
+    p="$(command -v ld.lld || command -v lld-link || true)"
+    if [ -n "$p" ]; then
+        dirname "$p"
+        return 0
+    fi
+    return 1
+}
+LLD_BIN="$(find_lld_bin || true)"
+if [ -z "$LLD_BIN" ] && command -v brew >/dev/null 2>&1; then
+    echo "lld linker not found; installing the Homebrew lld formula..."
+    brew install lld || true
+    LLD_PREFIX="$(brew --prefix lld 2>/dev/null || true)"
+    LLD_BIN="$(find_lld_bin || true)"
+fi
+if [ -z "$LLD_BIN" ]; then
+    echo "::error::lld linker (ld.lld / lld-link) not found and 'brew install lld' did not provide one; -fuse-ld=lld cannot work without it."
+    exit 1
+fi
+export PATH="$LLD_BIN:$PATH"
+LLD_LINK="$LLD_BIN/lld-link"
+[ -x "$LLD_LINK" ] || LLD_LINK="$LLD_BIN/ld.lld"
+LLD_BANNER="$("$LLD_LINK" --version 2>/dev/null || true)"
+echo "lld:     $LLD_LINK"
+echo "lld version:     ${LLD_BANNER%%$'\n'*}"
 
 # 1. Import libraries from the .def files (function lists mirror the
 #    __declspec(dllimport) declarations in the sources).
@@ -69,15 +117,38 @@ ls -lh "$OUT/win32/"
 CFLAGS=(--target=aarch64-pc-windows-msvc -O2 -ffreestanding -nostdlib
         -fno-stack-protector -fuse-ld=lld -Wno-unused-parameter)
 
+# Run one link step with output captured. On failure, mirror the tail of
+# the linker output as ::error:: annotations (one per line, %-escaped):
+# the ERR trap alone only surfaces the command line, and the raw job log
+# needs auth, so without this the actual linker error stays invisible
+# from the run page / public API.
+link_step() {
+    local log line
+    log="$(mktemp)"
+    if "$@" >"$log" 2>&1; then
+        cat "$log"
+        rm -f "$log"
+        return 0
+    fi
+    cat "$log" >&2
+    tail -n 12 "$log" | while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        line="${line//\%/%25}"
+        echo "::error::linker: ${line:0:280}"
+    done
+    rm -f "$log"
+    return 1
+}
+
 # 2. opt_hive_arm64.exe: console subsystem, kernel32 + advapi32.
-"$CLANG" "${CFLAGS[@]}" \
+link_step "$CLANG" "${CFLAGS[@]}" \
     -Wl,-entry:mainCRTStartup -Wl,-subsystem:console \
     "$ROOT/tools/opt_hive_arm64.c" \
     "$OUT/win32/kernel32.lib" "$OUT/win32/advapi32.lib" \
     -o "$OUT/opt_hive_arm64.exe"
 
 # 3. WinIOSBrowser.exe: windows subsystem, kernel32 + ws2_32.
-"$CLANG" "${CFLAGS[@]}" \
+link_step "$CLANG" "${CFLAGS[@]}" \
     -Wl,-entry:WinMainCRTStartup -Wl,-subsystem:windows \
     "$ROOT/tools/winios_browser_arm64.c" \
     "$OUT/win32/kernel32.lib" "$OUT/win32/ws2_32.lib" \
