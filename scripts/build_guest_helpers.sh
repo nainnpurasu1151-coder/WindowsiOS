@@ -39,8 +39,13 @@ if [ -z "${CLANG:-}" ] || [ ! -x "$CLANG" ] || [ -z "${DLLTOOL:-}" ] || [ ! -x "
 fi
 echo "clang:   $CLANG"
 echo "dlltool: $DLLTOOL"
-"$CLANG" --version | head -1
-"$DLLTOOL" --version | head -1
+# NB: do NOT use `| head -1` here. Under `set -o pipefail`, head exits after
+# the first line, the version printer then dies with SIGPIPE (141), and
+# pipefail turns that into a script failure at this line (seen in CI run #2).
+# `sed -n '1p'` prints the same first line but reads to EOF, so the producer
+# never gets SIGPIPE, while a genuine producer failure still propagates.
+"$CLANG" --version | sed -n '1p'
+"$DLLTOOL" --version | sed -n '1p'
 # clang -fuse-ld=lld needs ld.lld / lld-link next to clang; check early.
 if [ ! -x "$(dirname "$CLANG")/ld.lld" ] && [ ! -x "$(dirname "$CLANG")/lld-link" ]; then
     echo "::warning::no ld.lld/lld-link next to clang; -fuse-ld=lld may fail"
