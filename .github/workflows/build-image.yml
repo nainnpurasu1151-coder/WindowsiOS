@@ -1,0 +1,355 @@
+# .github/workflows/build-image.yml
+#
+# Builds the Windows 11 ARM64 machine image for WindowsiOS entirely on
+# GitHub-hosted macOS runners, no Mac needed:
+#
+#   windows11.hvsparse + code.fd + vars.fd   (artifact: WindowsiOS-Win11-machine)
+#
+# which Phase 3 copies into the app's Documents/Machines/Win11 folder.
+#
+# Pipeline (each stage is its own job = its own fresh runner, chained with
+# artifacts, so no single job approaches the 360-minute hosted-job limit):
+#
+#   helpers / fetch-helpers   guest helper exes for the optimizer
+#   prepare                   runner probe -> fetch ESD (UUP dump route by
+#                             default) -> build winvm -> installer image
+#   phase1                    WinPE boot: partition + DISM apply + bcdboot
+#   phase2                    first boot: specialize + OOBE + clean shutdown
+#   optimize                  offline bloat removal (WinPE + opt_hive exe),
+#                             hvsparse pack, final artifact
+#
+# Media source: scripts/ci/fetch_uup_esd.sh resolves a Windows 11 ARM64
+# build through the UUP dump JSON API; all files come from Microsoft's
+# update servers and are SHA-1 verified, then the official UUP converter
+# + scripts/ci/build_synthetic_esd.sh rebuild the retail ESD layout
+# (index 1 = setup files, 2 = WinPE, 6 = Pro) that the upstream
+# provisioning scripts hard-code. Set the esd_url input instead to feed a
+# direct .esd link (e.g. a fresh Microsoft software-download URL).
+#
+# FREE only on a PUBLIC repo (public repos: unlimited hosted minutes;
+# macOS minutes bill at 10x on private repos). Runner reality per GitHub's
+# reference: macOS arm64 standard = 3 vCPU (M1) / 7 GB RAM. The guest RAM
+# and the per-phase time caps are workflow inputs for exactly that reason.
+#
+# The fork's provisioning scripts gained matching env knobs
+# (WINIOS_PROVISION_STAGE / WINIOS_PHASE*_MINUTES / WINIOS_OPT_MINUTES /
+# WINIOS_VM_RAM); with none set they behave exactly like upstream.
+
+name: Build Windows 11 machine image
+
+on:
+  workflow_dispatch:
+    inputs:
+      esd_url:
+        description: "Direct .esd URL (optional; overrides the UUP route)"
+        type: string
+        default: ""
+      uup_uuid:
+        description: "UUP build UUID (optional; default: newest search hit)"
+        type: string
+        default: ""
+      uup_search:
+        description: "UUP build search string"
+        type: string
+        default: "26100"
+      language:
+        description: "Windows language (UUP set + synthetic ESD layout)"
+        type: choice
+        options:
+          - en-us
+          - ja-jp
+        default: en-us
+      vm_ram:
+        description: "Guest RAM (MB) while provisioning; lower if the 7 GB runner OOMs"
+        type: string
+        default: "4096"
+      phase1_minutes:
+        description: "Phase 1 (DISM) time cap"
+        type: string
+        default: "150"
+      phase2_minutes:
+        description: "Phase 2 (OOBE) time cap"
+        type: string
+        default: "240"
+      opt_minutes:
+        description: "Optimizer WinPE time cap"
+        type: string
+        default: "90"
+      helpers_run_id:
+        description: "Run ID of a 'Build WindowsiOS IPA' run holding a WindowsiOS-guest-helpers artifact (optional; empty = build helpers here)"
+        type: string
+        default: ""
+      min_free_gb:
+        description: "Fail fast if the runner has less free disk (GB)"
+        type: string
+        default: "55"
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+
+jobs:
+  # ------------------------------------------------------------------
+  helpers:
+    if: ${{ inputs.helpers_run_id == '' }}
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM
+        run: brew install llvm
+      - name: Build guest helper exes
+        run: bash scripts/build_guest_helpers.sh
+      - name: Upload guest helper exes
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-helpers
+          path: |
+            build/opt_hive_arm64.exe
+            build/WinIOSBrowser.exe
+          if-no-files-found: error
+
+  fetch-helpers:
+    if: ${{ inputs.helpers_run_id != '' }}
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download guest-helpers artifact from the IPA workflow run
+        uses: actions/download-artifact@v4
+        with:
+          pattern: WindowsiOS-guest-helpers-*
+          path: helpers-in
+          merge-multiple: true
+          run-id: ${{ inputs.helpers_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Re-upload as this run's guest-helpers artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-helpers
+          path: helpers-in/*.exe
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  prepare:
+    runs-on: macos-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe runner (CPU / RAM / free disk)
+        run: |
+          set -eux
+          echo "::notice::arch=$(uname -m) cpus=$(sysctl -n hw.ncpu) ram_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))"
+          df -h "$GITHUB_WORKSPACE"
+          FREE_GB=$(df -k "$GITHUB_WORKSPACE" | awk 'NR==2 {print int($4/1048576)}')
+          echo "::notice::free disk: ${FREE_GB} GB (required: ${{ inputs.min_free_gb }} GB)"
+          if [ "$FREE_GB" -lt "${{ inputs.min_free_gb }}" ]; then
+            echo "::error::Only ${FREE_GB} GB free on this runner; the image pipeline needs about 30 GB of working space on top of the preinstalled image. Lower min_free_gb only if you accept a mid-run ENOSPC."
+            exit 1
+          fi
+
+      - name: Install tools
+        run: brew install wimlib qemu libslirp pkg-config aria2 cabextract chntpw
+
+      - name: Fetch Windows media (UUP route or direct ESD URL)
+        env:
+          ESD_URL: ${{ inputs.esd_url }}
+          UUP_UUID: ${{ inputs.uup_uuid }}
+          UUP_SEARCH: ${{ inputs.uup_search }}
+          UUP_LANG: ${{ inputs.language }}
+          UUP_EDITION: professional
+        run: bash scripts/ci/fetch_uup_esd.sh
+
+      - name: Build macOS engine (winvm + hvsparse)
+        run: make -j"$(sysctl -n hw.ncpu)" all
+
+      - name: Build installer image (provision stage=installer)
+        env:
+          WINIOS_PROVISION_STAGE: installer
+        run: /opt/homebrew/bin/python3 scripts/provision_windows_arm64.py
+
+      - name: Upload installer image
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-inputs
+          path: work/installer_v4.img
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload ESD (for the optimizer job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-esd
+          path: work/downloads/Win11_24H2_ARM64_en-us.esd
+          compression-level: 0
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  phase1:
+    needs: prepare
+    runs-on: macos-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe runner
+        run: |
+          echo "::notice::arch=$(uname -m) cpus=$(sysctl -n hw.ncpu) ram_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))"
+          df -h "$GITHUB_WORKSPACE"
+      - name: Install tools
+        run: brew install qemu libslirp pkg-config
+      - name: Build macOS engine (winvm + hvsparse)
+        run: make -j"$(sysctl -n hw.ncpu)" all
+      - name: Download installer image
+        uses: actions/download-artifact@v4
+        with:
+          name: image-inputs
+          path: work
+      - name: "Phase 1: WinPE DISM apply"
+        env:
+          WINIOS_PROVISION_STAGE: phase1
+          WINIOS_PHASE1_MINUTES: ${{ inputs.phase1_minutes }}
+          WINIOS_VM_RAM: ${{ inputs.vm_ram }}
+        run: /opt/homebrew/bin/python3 scripts/provision_windows_arm64.py
+      - name: Pack disk image for transfer
+        run: ./build/hvsparse pack work/windows11.img work/windows11_p1.hvsparse
+      - name: Upload phase 1 output
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase1-out
+          path: |
+            work/windows11_p1.hvsparse
+            work/vars_post_dism.fd
+          compression-level: 0
+          if-no-files-found: error
+      - name: Upload phase 1 diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase1-diagnostics
+          path: |
+            work/prov_phase1.log
+            work/prov_phase1.png
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------------
+  phase2:
+    needs: phase1
+    runs-on: macos-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe runner
+        run: |
+          echo "::notice::arch=$(uname -m) cpus=$(sysctl -n hw.ncpu) ram_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))"
+          df -h "$GITHUB_WORKSPACE"
+      - name: Install tools
+        run: brew install qemu libslirp pkg-config
+      - name: Build macOS engine (winvm + hvsparse)
+        run: make -j"$(sysctl -n hw.ncpu)" all
+      - name: Download phase 1 output
+        uses: actions/download-artifact@v4
+        with:
+          name: phase1-out
+          path: work
+      - name: Unpack disk image
+        run: ./build/hvsparse unpack work/windows11_p1.hvsparse work/windows11.img
+      - name: "Phase 2: specialize + OOBE + clean shutdown"
+        env:
+          WINIOS_PROVISION_STAGE: phase2
+          WINIOS_PHASE2_MINUTES: ${{ inputs.phase2_minutes }}
+          WINIOS_VM_RAM: ${{ inputs.vm_ram }}
+        run: /opt/homebrew/bin/python3 scripts/provision_windows_arm64.py
+      - name: Pack disk image for transfer
+        run: ./build/hvsparse pack work/windows11.img work/windows11_base.hvsparse
+      - name: Upload phase 2 output
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2-out
+          path: |
+            work/windows11_base.hvsparse
+            work/vars_clean.fd
+            work/code.fd
+          compression-level: 0
+          if-no-files-found: error
+      - name: Upload phase 2 diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2-diagnostics
+          path: |
+            work/prov_phase2.log
+            work/prov_phase2.png
+          if-no-files-found: warn
+
+  # ------------------------------------------------------------------
+  optimize:
+    needs: [phase2, helpers, fetch-helpers]
+    if: >-
+      always() && needs.phase2.result == 'success' &&
+      (needs.helpers.result == 'success' || needs.fetch-helpers.result == 'success')
+    runs-on: macos-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe runner
+        run: |
+          echo "::notice::arch=$(uname -m) cpus=$(sysctl -n hw.ncpu) ram_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))"
+          df -h "$GITHUB_WORKSPACE"
+      - name: Install tools
+        run: brew install qemu libslirp pkg-config wimlib
+      - name: Build macOS engine (winvm + hvsparse)
+        run: make -j"$(sysctl -n hw.ncpu)" all
+      - name: Download phase 2 output
+        uses: actions/download-artifact@v4
+        with:
+          name: phase2-out
+          path: work
+      - name: Download ESD (optimizer builds its WinPE from it)
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-esd
+          path: work/downloads
+      - name: Download guest helper exes
+        uses: actions/download-artifact@v4
+        with:
+          name: guest-helpers
+          path: helpers
+      - name: Stage inputs
+        run: |
+          set -eux
+          ./build/hvsparse unpack work/windows11_base.hvsparse work/windows11.img
+          mkdir -p build
+          cp helpers/opt_hive_arm64.exe helpers/WinIOSBrowser.exe build/
+          ls -lh work/ build/
+      - name: "Optimize: offline bloat removal in WinPE"
+        env:
+          WINIOS_OPT_MINUTES: ${{ inputs.opt_minutes }}
+          WINIOS_VM_RAM: ${{ inputs.vm_ram }}
+        run: /opt/homebrew/bin/python3 scripts/optimize_windows_lite.py
+      - name: Pack final machine image
+        run: |
+          set -eux
+          mkdir -p out
+          ./build/hvsparse pack work/windows11_lite.img out/windows11.hvsparse
+          cp work/code.fd out/code.fd
+          cp work/vars_clean.fd out/vars.fd
+          ls -lh out/
+      - name: Upload final machine image
+        uses: actions/upload-artifact@v4
+        with:
+          name: WindowsiOS-Win11-machine
+          path: out/
+          compression-level: 0
+          if-no-files-found: error
+      - name: Upload optimizer diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: optimize-diagnostics
+          path: |
+            work/_opt_pe.log
+            work/_opt_pe_screen.png
+          if-no-files-found: warn
