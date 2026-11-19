@@ -11,8 +11,12 @@
 # artifacts, so no single job approaches the 360-minute hosted-job limit):
 #
 #   helpers / fetch-helpers   guest helper exes for the optimizer
-#   prepare                   runner probe -> fetch ESD (UUP dump route by
-#                             default) -> build winvm -> installer image
+#   fetch-esd / reuse-esd     fetch ESD (UUP dump route by default) OR
+#                             reuse the windows-esd artifact of a previous
+#                             run (input: esd_run_id) -- the fetch takes
+#                             ~40 min, so a run that already produced a
+#                             good ESD never has to fetch again
+#   installer                 ESD -> build winvm -> installer image
 #   phase1                    WinPE boot: partition + DISM apply + bcdboot
 #   phase2                    first boot: specialize + OOBE + clean shutdown
 #   optimize                  offline bloat removal (WinPE + opt_hive exe),
@@ -79,6 +83,10 @@ on:
         description: "Run ID of a 'Build WindowsiOS IPA' run holding a WindowsiOS-guest-helpers artifact (optional; empty = build helpers here)"
         type: string
         default: ""
+      esd_run_id:
+        description: "Run ID of a previous 'Build Windows 11 machine image' run holding a windows-esd artifact (optional; empty = fetch the media here, ~40 min)"
+        type: string
+        default: ""
       min_free_gb:
         description: "Fail fast if the runner has less free disk (GB)"
         type: string
@@ -133,9 +141,16 @@ jobs:
           if-no-files-found: error
 
   # ------------------------------------------------------------------
-  prepare:
+  # The media fetch (UUP download + converter + synthetic ESD) is by far
+  # the slowest preparatory step (~40 min) and its result is a single
+  # self-contained file, so it lives in its own job whose ONLY output is
+  # the windows-esd artifact. A later run can skip the fetch entirely by
+  # passing esd_run_id (same pattern as helpers_run_id above): reuse-esd
+  # then imports that run's artifact and re-uploads it under this run.
+  fetch-esd:
+    if: ${{ inputs.esd_run_id == '' }}
     runs-on: macos-latest
-    timeout-minutes: 150
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -163,6 +178,59 @@ jobs:
           UUP_EDITION: professional
         run: bash scripts/ci/fetch_uup_esd.sh
 
+      - name: Upload ESD
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-esd
+          path: work/downloads/Win11_24H2_ARM64_en-us.esd
+          compression-level: 0
+          if-no-files-found: error
+
+  reuse-esd:
+    if: ${{ inputs.esd_run_id != '' }}
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download windows-esd artifact from the previous image run
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-esd
+          path: esd-in
+          run-id: ${{ inputs.esd_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Re-upload as this run's windows-esd artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-esd
+          path: esd-in/*.esd
+          compression-level: 0
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  installer:
+    needs: [fetch-esd, reuse-esd]
+    if: >-
+      always() &&
+      (needs.fetch-esd.result == 'success' || needs.reuse-esd.result == 'success')
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe runner
+        run: |
+          echo "::notice::arch=$(uname -m) cpus=$(sysctl -n hw.ncpu) ram_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))"
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Install tools
+        run: brew install qemu libslirp pkg-config wimlib
+
+      - name: Download ESD
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-esd
+          path: work/downloads
+
       - name: Build macOS engine (winvm + hvsparse)
         run: make -j"$(sysctl -n hw.ncpu)" all
 
@@ -179,17 +247,9 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-      - name: Upload ESD (for the optimizer job)
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-esd
-          path: work/downloads/Win11_24H2_ARM64_en-us.esd
-          compression-level: 0
-          if-no-files-found: error
-
   # ------------------------------------------------------------------
   phase1:
-    needs: prepare
+    needs: installer
     runs-on: macos-latest
     timeout-minutes: 300
     steps:
